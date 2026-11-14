@@ -1,6 +1,6 @@
 # Larder server
 
-The self-hosted household server for the [Larder](../larder-app) kitchen app. It lets the people who live together share one pantry, one shopping list and their saved recipes.
+The self-hosted household server for the [Larder](https://github.com/Arthlec/larder-app) kitchen app. It lets the people who live together share one pantry, one shopping list and their saved recipes.
 
 It is a single Rust binary with an embedded SQLite database: nothing else to install. It is meant to run on a machine at home (a PC, a Raspberry Pi, a NAS).
 
@@ -70,7 +70,7 @@ cargo test --workspace
 
 ## API
 
-Defined by the `larder-api-types` crate, which the app also depends on.
+Defined by the `larder-api-types` crate, which the app also depends on. The app pins it to a git tag of this repository (currently `v0.1.0`), so a change to `crates/api-types` reaches the app only after a new tag is pushed and the app's `Cargo.toml` is updated to it.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
