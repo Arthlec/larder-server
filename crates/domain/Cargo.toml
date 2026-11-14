@@ -1,0 +1,10 @@
+[package]
+name = "larder-server-domain"
+description = "Business rules of the Larder household server. No IO."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
