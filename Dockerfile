@@ -23,5 +23,6 @@ ENV LARDER_BIND=0.0.0.0:8080 \
 VOLUME /data
 EXPOSE 8080
 # No HEALTHCHECK: the slim image has no HTTP client. Check from outside with
-# `curl http://<host>:8080/health`.
+# `curl -k https://<host>:8080/health`. The certificate fingerprint is in
+# the log (`podman logs larder`) and from `larder-server fingerprint`.
 CMD ["larder-server"]

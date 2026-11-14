@@ -1,13 +1,14 @@
 //! In-memory fakes of the ports.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use larder_server_domain::session::Session;
 use larder_server_domain::{Household, SyncRecord, User, incoming_wins};
 use uuid::Uuid;
 
-use crate::auth::AuthService;
+use crate::auth::{AuthPorts, AuthService};
 use crate::error::ServerResult;
 use crate::households::HouseholdService;
 use crate::ports::*;
@@ -134,8 +135,78 @@ impl RecordRepository for MemRecords {
     }
 }
 
+#[derive(Default)]
+pub struct MemSessions(Mutex<Vec<(String, Session)>>);
+
+impl MemSessions {
+    pub fn keys(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl SessionRepository for MemSessions {
+    async fn create(&self, token_hash: &str, session: &Session) -> ServerResult<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((token_hash.to_string(), session.clone()));
+        Ok(())
+    }
+    async fn find(&self, token_hash: &str) -> ServerResult<Option<Session>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k == token_hash)
+            .map(|(_, s)| s.clone()))
+    }
+    async fn touch(&self, token_hash: &str, now: i64) -> ServerResult<()> {
+        for (_, s) in self
+            .0
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|(k, _)| k == token_hash)
+        {
+            s.last_used_at = now;
+        }
+        Ok(())
+    }
+    async fn delete(&self, token_hash: &str) -> ServerResult<()> {
+        self.0.lock().unwrap().retain(|(k, _)| k != token_hash);
+        Ok(())
+    }
+    async fn delete_for_user(&self, user_id: Uuid) -> ServerResult<u64> {
+        let mut rows = self.0.lock().unwrap();
+        let before = rows.len();
+        rows.retain(|(_, s)| s.user_id != user_id);
+        Ok((before - rows.len()) as u64)
+    }
+    async fn purge(&self, idle_cutoff: i64, created_cutoff: i64) -> ServerResult<u64> {
+        let mut rows = self.0.lock().unwrap();
+        let before = rows.len();
+        rows.retain(|(_, s)| s.last_used_at > idle_cutoff && s.created_at > created_cutoff);
+        Ok((before - rows.len()) as u64)
+    }
+}
+
 /// Reversible "hash", enough to check that the plain password is not stored.
-pub struct FakeHasher;
+/// Counts verifications, to check that every sign-in checks a password.
+#[derive(Default)]
+pub struct FakeHasher(AtomicU64);
+
+impl FakeHasher {
+    pub fn verifications(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 #[async_trait]
 impl PasswordHasher for FakeHasher {
@@ -146,18 +217,42 @@ impl PasswordHasher for FakeHasher {
         ))
     }
     async fn verify(&self, password: &str, hash: &str) -> ServerResult<bool> {
+        self.0.fetch_add(1, Ordering::SeqCst);
         Ok(self.hash(password).await? == hash)
     }
 }
 
-pub struct FakeTokens;
+/// Sequential tokens; the "hash" is a visible transformation.
+#[derive(Default)]
+pub struct FakeTokens(AtomicU64);
 
-impl TokenService for FakeTokens {
-    fn issue(&self, user_id: Uuid) -> ServerResult<String> {
-        Ok(format!("token:{user_id}"))
+impl SessionTokens for FakeTokens {
+    fn generate(&self) -> String {
+        format!("token{}", self.0.fetch_add(1, Ordering::SeqCst))
     }
-    fn verify(&self, token: &str) -> Option<Uuid> {
-        token.strip_prefix("token:")?.parse().ok()
+    fn hash(&self, token: &str) -> String {
+        format!("hash-of-{token}")
+    }
+}
+
+/// A clock that only moves when told to.
+pub struct FakeClock(AtomicI64);
+
+impl Default for FakeClock {
+    fn default() -> Self {
+        Self(AtomicI64::new(1_800_000_000))
+    }
+}
+
+impl FakeClock {
+    pub fn advance(&self, secs: i64) {
+        self.0.fetch_add(secs, Ordering::SeqCst);
+    }
+}
+
+impl Clock for FakeClock {
+    fn now(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
     }
 }
 
@@ -179,16 +274,24 @@ pub struct Fakes {
     pub users: Arc<MemUsers>,
     pub households: Arc<MemHouseholds>,
     pub records: Arc<MemRecords>,
+    pub sessions: Arc<MemSessions>,
+    pub hasher: Arc<FakeHasher>,
+    pub tokens: Arc<FakeTokens>,
+    pub clock: Arc<FakeClock>,
     pub ids: Arc<CountingIds>,
 }
 
 impl Fakes {
     pub fn auth(&self, allow_registration: bool) -> AuthService {
         AuthService::new(
-            self.users.clone(),
-            Arc::new(FakeHasher),
-            Arc::new(FakeTokens),
-            self.ids.clone(),
+            AuthPorts {
+                users: self.users.clone(),
+                sessions: self.sessions.clone(),
+                hasher: self.hasher.clone(),
+                tokens: self.tokens.clone(),
+                ids: self.ids.clone(),
+                clock: self.clock.clone(),
+            },
             allow_registration,
         )
     }
@@ -208,7 +311,7 @@ impl Fakes {
     /// Registers a user and returns it.
     pub async fn user(&self, name: &str) -> User {
         let auth = self.auth(true);
-        let token = auth.register(name, "longenough").await.unwrap();
+        let token = auth.register(name, "longenough", None).await.unwrap();
         auth.authenticate(&token).await.unwrap()
     }
 

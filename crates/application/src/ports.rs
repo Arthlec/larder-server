@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use larder_server_domain::session::Session;
 use larder_server_domain::{Household, SyncRecord, User};
 use uuid::Uuid;
 
@@ -11,6 +12,21 @@ pub trait UserRepository: Send + Sync {
     /// Returns `false` (and stores nothing) if the username is taken.
     async fn insert(&self, user: &User) -> ServerResult<bool>;
     async fn set_household(&self, user_id: Uuid, household_id: Uuid) -> ServerResult<()>;
+}
+
+/// Signed-in sessions, keyed by the hash of their token: the plain token
+/// is never stored.
+#[async_trait]
+pub trait SessionRepository: Send + Sync {
+    async fn create(&self, token_hash: &str, session: &Session) -> ServerResult<()>;
+    async fn find(&self, token_hash: &str) -> ServerResult<Option<Session>>;
+    async fn touch(&self, token_hash: &str, now: i64) -> ServerResult<()>;
+    async fn delete(&self, token_hash: &str) -> ServerResult<()>;
+    /// Returns how many were deleted.
+    async fn delete_for_user(&self, user_id: Uuid) -> ServerResult<u64>;
+    /// Deletes sessions last used before `idle_cutoff` or created before
+    /// `created_cutoff`. Returns how many.
+    async fn purge(&self, idle_cutoff: i64, created_cutoff: i64) -> ServerResult<u64>;
 }
 
 #[async_trait]
@@ -48,10 +64,15 @@ pub trait PasswordHasher: Send + Sync {
     async fn verify(&self, password: &str, hash: &str) -> ServerResult<bool>;
 }
 
-pub trait TokenService: Send + Sync {
-    fn issue(&self, user_id: Uuid) -> ServerResult<String>;
-    /// The user id, if the token is genuine and not expired.
-    fn verify(&self, token: &str) -> Option<Uuid>;
+/// Session tokens: unguessable random strings, stored only as a hash.
+pub trait SessionTokens: Send + Sync {
+    fn generate(&self) -> String;
+    fn hash(&self, token: &str) -> String;
+}
+
+/// Seconds since the Unix epoch.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> i64;
 }
 
 /// Source of random ids (v4). A port so tests are deterministic.

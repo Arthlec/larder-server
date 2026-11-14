@@ -34,7 +34,7 @@ jobs:
         run: |
           docker run -d --name larder -p 8080:8080 larder-server
           for i in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:8080/health && exit 0
+            curl -fsSk https://127.0.0.1:8080/health && docker logs larder | grep "certificate fingerprint" && exit 0
             sleep 1
           done
           docker logs larder

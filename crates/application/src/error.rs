@@ -9,6 +9,8 @@ pub enum ServerError {
     BadCredentials,
     #[error("sign in again")]
     BadToken,
+    #[error("too many attempts, try again in {} minute(s)", (retry_after_secs + 59) / 60)]
+    TooManyAttempts { retry_after_secs: i64 },
     #[error("registration is closed on this server")]
     RegistrationClosed,
     #[error("{0}")]

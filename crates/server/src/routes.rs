@@ -1,8 +1,10 @@
+use std::net::{IpAddr, SocketAddr};
+
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, FromRequestParts, Query, State};
-use axum::http::StatusCode;
-use axum::http::header::AUTHORIZATION;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Query, State};
+use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::request::Parts;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,6 +22,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
+        .route("/auth/logout", post(logout))
+        .route("/auth/logout-all", post(logout_all))
         .route("/me", get(me))
         .route("/households", post(create_household))
         .route("/households/join", post(join_household))
@@ -30,11 +34,17 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Any failure, rendered as an `ErrorResponse` with a fitting status.
-struct ApiError(StatusCode, String);
+struct ApiError(StatusCode, String, Option<i64>);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(api::ErrorResponse { error: self.1 })).into_response()
+        let mut response = (self.0, Json(api::ErrorResponse { error: self.1 })).into_response();
+        if let Some(secs) = self.2 {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(secs.max(1)));
+        }
+        response
     }
 }
 
@@ -43,6 +53,7 @@ impl From<ServerError> for ApiError {
         let status = match &error {
             ServerError::Invalid(_) => StatusCode::BAD_REQUEST,
             ServerError::BadCredentials | ServerError::BadToken => StatusCode::UNAUTHORIZED,
+            ServerError::TooManyAttempts { .. } => StatusCode::TOO_MANY_REQUESTS,
             ServerError::RegistrationClosed => StatusCode::FORBIDDEN,
             ServerError::Conflict(_) | ServerError::NoHousehold => StatusCode::CONFLICT,
             ServerError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -52,19 +63,23 @@ impl From<ServerError> for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
-        ApiError(status, error.to_string())
+        let retry_after = match &error {
+            ServerError::TooManyAttempts { retry_after_secs } => Some(*retry_after_secs),
+            _ => None,
+        };
+        ApiError(status, error.to_string(), retry_after)
     }
 }
 
 impl From<JsonRejection> for ApiError {
     fn from(rejection: JsonRejection) -> Self {
-        ApiError(rejection.status(), rejection.body_text())
+        ApiError(rejection.status(), rejection.body_text(), None)
     }
 }
 
 impl From<QueryRejection> for ApiError {
     fn from(rejection: QueryRejection) -> Self {
-        ApiError(rejection.status(), rejection.body_text())
+        ApiError(rejection.status(), rejection.body_text(), None)
     }
 }
 
@@ -73,17 +88,46 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 /// The signed-in user, from the `Authorization: Bearer` header.
 struct Auth(User);
 
-impl FromRequestParts<AppState> for Auth {
+/// The bearer token itself, for ending its session.
+struct Token(String);
+
+impl FromRequestParts<AppState> for Token {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+    async fn from_request_parts(parts: &mut Parts, _: &AppState) -> Result<Self, ApiError> {
         let token = parts
             .headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .ok_or(ServerError::BadToken)?;
-        Ok(Auth(state.auth.authenticate(token.trim()).await?))
+        Ok(Token(token.trim().to_string()))
+    }
+}
+
+impl FromRequestParts<AppState> for Auth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        let Token(token) = Token::from_request_parts(parts, state).await?;
+        Ok(Auth(state.auth.authenticate(&token).await?))
+    }
+}
+
+/// The address the request came from. Unknown only when the router is
+/// called without a network listener, as in tests.
+struct ClientIp(Option<IpAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(ClientIp(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|info| info.0.ip()),
+        ))
     }
 }
 
@@ -119,26 +163,46 @@ async fn health() -> Json<api::HealthResponse> {
 
 async fn register(
     State(state): State<AppState>,
+    ClientIp(client): ClientIp,
     body: Result<Json<api::Credentials>, JsonRejection>,
 ) -> ApiResult<api::TokenResponse> {
     let Json(credentials) = body?;
     let token = state
         .auth
-        .register(&credentials.username, &credentials.password)
+        .register(&credentials.username, &credentials.password, client)
         .await?;
     Ok(Json(api::TokenResponse { token }))
 }
 
 async fn login(
     State(state): State<AppState>,
+    ClientIp(client): ClientIp,
     body: Result<Json<api::Credentials>, JsonRejection>,
 ) -> ApiResult<api::TokenResponse> {
     let Json(credentials) = body?;
     let token = state
         .auth
-        .login(&credentials.username, &credentials.password)
+        .login(&credentials.username, &credentials.password, client)
         .await?;
     Ok(Json(api::TokenResponse { token }))
+}
+
+/// Ends this device's session. Succeeds even if it had already ended.
+async fn logout(
+    State(state): State<AppState>,
+    Token(token): Token,
+) -> Result<StatusCode, ApiError> {
+    state.auth.logout(&token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ends every session of the account, on every device.
+async fn logout_all(
+    State(state): State<AppState>,
+    Auth(user): Auth,
+) -> Result<StatusCode, ApiError> {
+    state.auth.logout_everywhere(&user).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn me(State(state): State<AppState>, Auth(user): Auth) -> ApiResult<api::MeResponse> {

@@ -9,15 +9,22 @@
 //! | GET    | `/health`          | -                    | `HealthResponse`    |
 //! | POST   | `/auth/register`   | `Credentials`        | `TokenResponse`     |
 //! | POST   | `/auth/login`      | `Credentials`        | `TokenResponse`     |
+//! | POST   | `/auth/logout`     | -                    | 204, no body        |
+//! | POST   | `/auth/logout-all` | -                    | 204, no body        |
 //! | GET    | `/me`              | -                    | `MeResponse`        |
 //! | POST   | `/households`      | `CreateHousehold`    | `HouseholdDto`      |
 //! | POST   | `/households/join` | `JoinHousehold`      | `HouseholdDto`      |
 //! | POST   | `/sync/push`       | `PushRequest`        | `PushResponse`      |
 //! | GET    | `/sync/pull`       | `?cursor=<i64>`      | `PullResponse`      |
 //!
-//! Every route except `/health` and `/auth/*` needs
-//! `Authorization: Bearer <token>`. Errors are an `ErrorResponse` with a
-//! 4xx/5xx status.
+//! The server is reached over HTTPS only. Every route except `/health`,
+//! `/auth/register` and `/auth/login` needs `Authorization: Bearer <token>`.
+//! A token is a session: it ends with `/auth/logout`, after 30 days unused,
+//! or a year after signing in.
+//!
+//! Errors are an `ErrorResponse` with a 4xx/5xx status. Too many failed
+//! sign-ins (or account creations) get 429 with a `Retry-After` header in
+//! seconds.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

@@ -4,8 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use larder_server_application::error::{ServerError, ServerResult};
 use larder_server_application::ports::{
-    HouseholdRepository, RecordRepository, Sequenced, UserRepository,
+    HouseholdRepository, RecordRepository, Sequenced, SessionRepository, UserRepository,
 };
+use larder_server_domain::session::Session;
 use larder_server_domain::{Household, RecordKind, SyncRecord, User};
 use sqlx::Row;
 use sqlx::sqlite::{
@@ -13,11 +14,13 @@ use sqlx::sqlite::{
 };
 use uuid::Uuid;
 
+use crate::tls::TlsIdentity;
+
 fn internal(e: impl std::fmt::Display) -> ServerError {
     ServerError::Internal(e.to_string())
 }
 
-/// SQLite database of the server. Implements all three repositories.
+/// SQLite database of the server. Implements every repository.
 #[derive(Clone)]
 pub struct Db {
     pool: SqlitePool,
@@ -67,18 +70,47 @@ impl Db {
         })
     }
 
-    /// The token signing secret, created on first use and kept in the
-    /// database so tokens survive a restart without any configuration.
-    pub async fn signing_secret(&self) -> ServerResult<String> {
-        let fresh = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        sqlx::query("INSERT OR IGNORE INTO meta(key, value) VALUES ('jwt_secret', ?1)")
-            .bind(&fresh)
+    /// The server's TLS certificate and key, created on first use and kept
+    /// in the database: a backup of the file keeps the identity that phones
+    /// have pinned.
+    pub async fn tls_identity(&self) -> ServerResult<TlsIdentity> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let stored: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM meta WHERE key IN ('tls_cert', 'tls_key')")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(internal)?;
+        let find = |name: &str| {
+            stored
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        if let (Some(cert_pem), Some(key_pem)) = (find("tls_cert"), find("tls_key")) {
+            return Ok(TlsIdentity { cert_pem, key_pem });
+        }
+        let identity = TlsIdentity::generate()?;
+        for (key, value) in [
+            ("tls_cert", &identity.cert_pem),
+            ("tls_key", &identity.key_pem),
+        ] {
+            sqlx::query("INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)")
+                .bind(key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal)?;
+        }
+        tx.commit().await.map_err(internal)?;
+        Ok(identity)
+    }
+
+    /// Forgets the TLS identity; a new one is made on the next start.
+    pub async fn reset_tls_identity(&self) -> ServerResult<()> {
+        sqlx::query("DELETE FROM meta WHERE key IN ('tls_cert', 'tls_key')")
             .execute(&self.pool)
             .await
-            .map_err(internal)?;
-        sqlx::query_scalar("SELECT value FROM meta WHERE key = 'jwt_secret'")
-            .fetch_one(&self.pool)
-            .await
+            .map(|_| ())
             .map_err(internal)
     }
 }
@@ -269,6 +301,78 @@ impl RecordRepository for Db {
     }
 }
 
+#[async_trait]
+impl SessionRepository for Db {
+    async fn create(&self, token_hash: &str, session: &Session) -> ServerResult<()> {
+        sqlx::query(
+            "INSERT INTO sessions(token_hash, user_id, created_at, last_used_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(token_hash)
+        .bind(session.user_id.to_string())
+        .bind(session.created_at)
+        .bind(session.last_used_at)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(internal)
+    }
+
+    async fn find(&self, token_hash: &str) -> ServerResult<Option<Session>> {
+        sqlx::query("SELECT user_id, created_at, last_used_at FROM sessions WHERE token_hash = ?1")
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(internal)?
+            .map(|row| {
+                Ok(Session {
+                    user_id: uuid_col(&row, "user_id")?,
+                    created_at: row.try_get("created_at").map_err(internal)?,
+                    last_used_at: row.try_get("last_used_at").map_err(internal)?,
+                })
+            })
+            .transpose()
+    }
+
+    async fn touch(&self, token_hash: &str, now: i64) -> ServerResult<()> {
+        sqlx::query("UPDATE sessions SET last_used_at = ?2 WHERE token_hash = ?1")
+            .bind(token_hash)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(internal)
+    }
+
+    async fn delete(&self, token_hash: &str) -> ServerResult<()> {
+        sqlx::query("DELETE FROM sessions WHERE token_hash = ?1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(internal)
+    }
+
+    async fn delete_for_user(&self, user_id: Uuid) -> ServerResult<u64> {
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?1")
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(internal)
+    }
+
+    async fn purge(&self, idle_cutoff: i64, created_cutoff: i64) -> ServerResult<u64> {
+        sqlx::query("DELETE FROM sessions WHERE last_used_at <= ?1 OR created_at <= ?2")
+            .bind(idle_cutoff)
+            .bind(created_cutoff)
+            .execute(&self.pool)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(internal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,11 +553,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signing_secret_is_created_once() {
+    async fn tls_identity_is_created_once_and_can_be_reset() {
         let db = db().await;
-        let first = db.signing_secret().await.unwrap();
-        assert_eq!(first.len(), 64);
-        assert_eq!(db.signing_secret().await.unwrap(), first);
+        let first = db.tls_identity().await.unwrap();
+        assert_eq!(db.tls_identity().await.unwrap(), first);
+        db.reset_tls_identity().await.unwrap();
+        assert_ne!(db.tls_identity().await.unwrap(), first);
+    }
+
+    fn session(user: &User, created_at: i64, last_used_at: i64) -> Session {
+        Session {
+            user_id: user.id,
+            created_at,
+            last_used_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_are_stored_touched_and_deleted() {
+        let db = db().await;
+        let ana = a_user("ana");
+        let bob = a_user("bob");
+        UserRepository::insert(&db, &ana).await.unwrap();
+        UserRepository::insert(&db, &bob).await.unwrap();
+        db.create("h1", &session(&ana, 10, 10)).await.unwrap();
+        db.create("h2", &session(&ana, 20, 20)).await.unwrap();
+        db.create("h3", &session(&bob, 30, 30)).await.unwrap();
+
+        assert_eq!(db.find("h1").await.unwrap(), Some(session(&ana, 10, 10)));
+        assert_eq!(db.find("nope").await.unwrap(), None);
+        db.touch("h1", 99).await.unwrap();
+        assert_eq!(db.find("h1").await.unwrap(), Some(session(&ana, 10, 99)));
+
+        db.delete("h1").await.unwrap();
+        assert_eq!(db.find("h1").await.unwrap(), None);
+        assert_eq!(db.delete_for_user(ana.id).await.unwrap(), 1);
+        assert!(db.find("h3").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn purge_uses_both_cutoffs() {
+        let db = db().await;
+        let ana = a_user("ana");
+        UserRepository::insert(&db, &ana).await.unwrap();
+        db.create("idle", &session(&ana, 50, 5)).await.unwrap();
+        db.create("old", &session(&ana, 1, 60)).await.unwrap();
+        db.create("fine", &session(&ana, 50, 60)).await.unwrap();
+        assert_eq!(db.purge(5, 1).await.unwrap(), 2);
+        assert!(db.find("fine").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -463,14 +610,14 @@ mod tests {
         let path = dir.join("server.db");
         let path = path.to_str().unwrap();
         let ana = a_user("ana");
-        let secret = {
+        let identity = {
             let db = Db::open(path).await.unwrap();
             UserRepository::insert(&db, &ana).await.unwrap();
-            db.signing_secret().await.unwrap()
+            db.tls_identity().await.unwrap()
         };
         let db = Db::open(path).await.unwrap();
         assert_eq!(db.find_by_username("ana").await.unwrap(), Some(ana));
-        assert_eq!(db.signing_secret().await.unwrap(), secret);
+        assert_eq!(db.tls_identity().await.unwrap(), identity);
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
     }

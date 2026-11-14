@@ -1,10 +1,12 @@
 //! End-to-end tests of the HTTP API: real router, real use cases, real
 //! SQLite (in memory). Only password hashing is turned down for speed.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use larder_api_types::*;
@@ -21,9 +23,7 @@ async fn app_with(allow_registration: bool) -> Router {
         db,
         Arc::new(Argon2Hasher::insecure_fast()),
         allow_registration,
-    )
-    .await
-    .unwrap();
+    );
     router(state)
 }
 
@@ -191,6 +191,7 @@ async fn protected_routes_reject_missing_or_bad_tokens() {
         ("GET", "/me"),
         ("POST", "/households"),
         ("POST", "/households/join"),
+        ("POST", "/auth/logout-all"),
         ("POST", "/sync/push"),
         ("GET", "/sync/pull"),
     ] {
@@ -419,4 +420,103 @@ async fn invalid_push_is_rejected() {
     assert!(status.is_client_error());
     let (status, _) = call(&app, "GET", "/sync/pull?cursor=abc", Some(&ana), None).await;
     assert!(status.is_client_error());
+}
+
+fn login_request(name: &str, password: &str, from: [u8; 4]) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"username": name, "password": password}).to_string(),
+        ))
+        .unwrap();
+    // What the network listener adds to every request.
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from((from, 50000))));
+    request
+}
+
+#[tokio::test]
+async fn repeated_wrong_passwords_are_answered_with_429_and_retry_after() {
+    let app = app().await;
+    register(&app, "ana").await;
+    for _ in 0..6 {
+        let response = app
+            .clone()
+            .oneshot(login_request("ana", "wrongpassword", [192, 168, 1, 20]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    // Even the right password is refused while locked.
+    let response = app
+        .clone()
+        .oneshot(login_request("ana", "longenough", [192, 168, 1, 20]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], "30");
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error(&body), "too many attempts, try again in 1 minute(s)");
+}
+
+#[tokio::test]
+async fn logout_ends_only_this_session() {
+    let app = app().await;
+    let phone = register(&app, "ana").await;
+    let (_, body) = call(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({"username": "ana", "password": "longenough"})),
+    )
+    .await;
+    let laptop = parse::<TokenResponse>(body).token;
+
+    let (status, _) = call(&app, "POST", "/auth/logout", Some(&phone), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        call(&app, "GET", "/me", Some(&phone), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&app, "GET", "/me", Some(&laptop), None).await.0,
+        StatusCode::OK
+    );
+    // Logging out twice is harmless.
+    let (status, _) = call(&app, "POST", "/auth/logout", Some(&phone), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn logout_all_ends_every_session_of_the_account_only() {
+    let app = app().await;
+    let phone = register(&app, "ana").await;
+    let (_, body) = call(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({"username": "ana", "password": "longenough"})),
+    )
+    .await;
+    let laptop = parse::<TokenResponse>(body).token;
+    let bob = register(&app, "bob").await;
+
+    let (status, _) = call(&app, "POST", "/auth/logout-all", Some(&phone), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for token in [&phone, &laptop] {
+        assert_eq!(
+            call(&app, "GET", "/me", Some(token), None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        call(&app, "GET", "/me", Some(&bob), None).await.0,
+        StatusCode::OK
+    );
 }

@@ -12,8 +12,12 @@ larder-server-application.workspace = true
 larder-server-infrastructure.workspace = true
 tokio.workspace = true
 axum = "0.8"
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+# ring, not aws-lc-rs: no cmake or NASM needed to build.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 [dev-dependencies]
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 serde.workspace = true
 serde_json.workspace = true
 tower = { version = "0.5", features = ["util"] }

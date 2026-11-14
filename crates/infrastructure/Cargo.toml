@@ -1,6 +1,6 @@
 [package]
 name = "larder-server-infrastructure"
-description = "Adapters of the Larder server: SQLite (sqlx), Argon2, JWT."
+description = "Adapters of the Larder server: SQLite (sqlx), Argon2, sessions, TLS identity."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,4 +14,9 @@ tokio.workspace = true
 uuid.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 argon2 = "0.5"
-jsonwebtoken = "9"
+base64 = "0.22"
+getrandom = "0.2"
+sha2 = "0.10"
+# ring, not aws-lc-rs: no cmake or NASM needed to build.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls-pki-types = { version = "1", features = ["std"] }

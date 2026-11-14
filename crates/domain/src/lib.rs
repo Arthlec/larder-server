@@ -166,6 +166,9 @@ pub fn incoming_wins(stored_updated_at: Option<i64>, incoming_updated_at: i64) -
     stored_updated_at.is_none_or(|stored| incoming_updated_at > stored)
 }
 
+pub mod lockout;
+pub mod session;
+
 #[cfg(test)]
 mod tests {
     use super::*;
