@@ -23,3 +23,19 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the container image
+        run: docker build -t larder-server .
+      - name: Start it and check /health
+        run: |
+          docker run -d --name larder -p 8080:8080 larder-server
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/health && exit 0
+            sleep 1
+          done
+          docker logs larder
+          exit 1

@@ -16,7 +16,7 @@ What it deliberately does not do: talk to recipe websites (the app does that its
 
 Done and covered by 74 automated tests, including end-to-end tests of the HTTP API. Also verified with the app's own sync client: two simulated devices sharing a pantry, a shopping list, a hand-written recipe and a favourite.
 
-Not yet done: the `Dockerfile` has not been built, and the server has only been run on Linux.
+The container image is verified with Podman: it builds (85 MB), runs as an unprivileged user, keeps accounts and data across restarts and re-created containers, and stops cleanly on `podman stop`. The server has only been run on Linux.
 
 ## Run it
 
@@ -31,6 +31,17 @@ larder-server 0.1.0 listening on http://0.0.0.0:8080 (database: larder-server.db
 Check it from another device on the same network: `http://<this-machine's-address>:8080/health`.
 
 In the app, open **Settings → Household sync**, enter that address, and create an account.
+
+### In a container
+
+The same commands work with Docker (replace `podman` with `docker`):
+
+```sh
+podman build -t larder-server .
+podman run -d --name larder -p 8080:8080 -v larder-data:/data larder-server
+```
+
+The database lives in the `larder-data` volume, so the container can be removed and recreated without losing accounts or data. The server runs as an unprivileged user inside the container. Rootless Podman needs a range of sub-IDs for your user; if the build fails with "insufficient UIDs or GIDs", run `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER && podman system migrate` once.
 
 ### Configuration
 
@@ -49,7 +60,7 @@ The secret used to sign access tokens is generated on first start and stored in 
 - The server speaks plain HTTP. On a home network that is usually acceptable; **do not expose it to the internet as is**. To reach it from outside, put it behind a VPN (WireGuard, Tailscale) or a reverse proxy that adds HTTPS.
 - Anyone who can reach the server can create an account while registration is open. An account alone sees nothing: data belongs to a household, and joining one needs its invite code.
 - There is no limit on sign-in attempts yet.
-- Back up by copying the database file while the server is stopped.
+- Back up by copying the database file while the server is stopped. In a container: `podman stop larder`, then copy it out with `podman cp larder:/data/larder-server.db .`.
 
 ## Tests
 
@@ -98,10 +109,10 @@ Done:
 - [x] Record sync with last-write-wins and tombstones
 - [x] Zero-configuration start (embedded database, generated signing secret)
 - [x] Option to close registration
+- [x] Container image (Podman or Docker), built and checked in CI
 
 Next:
 
-- [ ] Build and test the Docker image
 - [ ] Limit sign-in attempts
 - [ ] Leave a household, remove a member, regenerate the invite code
 - [ ] Change password, delete account

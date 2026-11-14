@@ -56,6 +56,12 @@ Ten characters from an alphabet without look-alikes (no `0`/`O`, `1`/`I`/`L`), a
 
 The server is meant for a home network, where setting up certificates is the main obstacle to self-hosting. The README says plainly not to expose it to the internet and points to a VPN or a reverse proxy for remote access.
 
-## 10. MIT license
+## 10. Container image on Debian slim
+
+Two stages: build in the official Rust image, run in `debian:bookworm-slim`, both on the same Debian release so the binary finds the glibc it was linked against. The result is about 85 MB. The server runs as an unprivileged user and keeps its database in the `/data` volume. It handles SIGTERM itself, because as process 1 in a container it would otherwise ignore `stop` and be killed after a timeout.
+
+**Rejected.** A static musl binary on `scratch` or distroless (smaller, but a second build target to maintain for little gain at home); Alpine (musl again).
+
+## 11. MIT license
 
 Chosen by the project owner.
